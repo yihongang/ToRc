@@ -53,8 +53,9 @@ every tensor and expert with the GGUF byte for byte. A file that fails is not to
 licences; ToRc ships no weights.
 
 Supported: Qwen3.6-35B-A3B, Qwen3-30B-A3B, Qwen3.8 Flash Next, Qwen3-Next 80B, Qwen3.5 122B, the dense Qwen3.5 models,
-ERNIE-4.5-21B-A3B, GLM-4.7-Flash, Moonlight, LFM2.5-8B, Gemma 4 26B-A4B and gpt-oss, all served by `torc-server` (it
-reads the model's architecture from the file). Quant types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K,
+ERNIE-4.5-21B-A3B, GLM-4.7-Flash, Moonlight, LFM2.5-8B, Gemma 4 26B-A4B, gpt-oss and Inkling 2 Mini (the
+`inkling2_loop` mainline files; Unsloth's `inkling2` layout and NVFP4 experts are not supported yet), all served by
+`torc-server` (it reads the model's architecture from the file). Quant types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K,
 Q4_K, Q5_K, Q6_K, MXFP4, and on any CPU through portable kernels: Q2_K, Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ1_M (Q2_K
 and Q2_0 with vector code on x86 and ARM).
 

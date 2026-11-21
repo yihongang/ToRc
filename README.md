@@ -78,13 +78,17 @@ on your hardware.
 | LFM2.5-8B | `lfm2moe` | its own template's format |
 | Gemma 4 26B-A4B | `gemma4` | its own template's format |
 | gpt-oss | `gpt-oss` | its own template's format |
+| Inkling 2 Mini (text) | `inkling2_loop` | its own template's format |
 
 Quant types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4, and Q2_K, Q2_0,
 IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ1_M through portable kernels that run on any CPU (Q2_K and Q2_0 with vector code
 on x86 and ARM; the others are slower than the types with kernels of their own).
 
 Any GGUF of a supported architecture should work, including fine-tunes and abliterated versions, as long as its quant
-types are in the list. The app checks before converting that the model will run and tells you why if it won't;
+types are in the list. For Inkling 2, use a mainline conversion (the `inkling2_loop` architecture, as in
+[ggml-org's IQ4_NL and Q8_0 files](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF)); the `inkling2` files from
+Unsloth's own runtime, and its NVFP4 expert tensors, are not supported yet. A Mainline_Support file's `.gguf_file` name
+is accepted as a GGUF too. The app checks before converting that the model will run and tells you why if it won't;
 `torc plan <model.gguf>` does the same from the command line.
 
 For replies, active parameters matter, not the file size: the 35B-A3B writes faster than Gemma's 26B-A4B on the same

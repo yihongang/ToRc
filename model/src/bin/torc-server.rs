@@ -892,6 +892,7 @@ fn main() {
     let mut e = match arch.as_deref() {
         Some("gemma4") => model::models::gemma::serve::open(path, ctx, name),
         Some("gpt-oss") => model::models::gptoss::serve::open(path, ctx, name),
+        Some("inkling2_loop") => model::models::inkling2::serve::open(path, ctx, name),
         // every other architecture is one of Model's (models/qwen), which refuses a file it can't run
         _ => model::models::qwen::serve::open(path, ctx, name),
     };

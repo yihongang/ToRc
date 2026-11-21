@@ -26,6 +26,7 @@ pub use layers::{act, attn, fattn, mla, moe, ops, rec};
 pub use models::gemma::npu_gemma;
 pub use models::gemma::{gemma, gemma_mtp};
 pub use models::gptoss::gptoss;
+pub use models::inkling2::model::Inkling;
 pub use models::qwen::hparams::Hparams;
 pub use models::qwen::{forward, hc, hparams, mtp, mtp_hc};
 pub use runtime::{

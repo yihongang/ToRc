@@ -39,7 +39,8 @@ impl Preflight {
 
 /// Checks a model file: a GGUF by its name (.gguf, or the first part of a split one), else a ToRc file.
 pub fn check_path(path: &str) -> Result<Preflight> {
-    let f = if path.to_ascii_lowercase().ends_with(".gguf") {
+    let lower = path.to_ascii_lowercase();
+    let f = if lower.ends_with(".gguf") || lower.ends_with(".gguf_file") {
         format::convert::plan_gguf(path)?
     } else {
         File::open(path)?
@@ -56,6 +57,12 @@ fn has_experts(f: &File, l: u32) -> bool {
 pub fn check(f: &File) -> Result<Preflight> {
     let arch = f.header.arch.clone();
     if !models::ARCHS.contains(&arch.as_str()) {
+        if arch == "inkling2" {
+            return err(
+                "its architecture, inkling2, is the Unsloth runtime's loop layout: ToRc runs the Mainline_Support \
+                 files, whose architecture is inkling2_loop (use Mainline_Support/<model>.gguf_file)",
+            );
+        }
         let named = if arch.is_empty() { "unnamed" } else { arch.as_str() };
         return err(format!(
             "its architecture, {named}, isn't one ToRc runs yet (it runs {})",
@@ -70,6 +77,8 @@ pub fn check(f: &File) -> Result<Preflight> {
         models::qwen::hparams::Hparams::from_file(f)?.n_layer
     } else if arch == "gemma4" {
         models::gemma::gemma::GemmaHp::from_meta(&f.metadata)?.n_layer as u32
+    } else if arch == "inkling2_loop" {
+        models::inkling2::hparams::Hp::from_file(f)?.n_layer
     } else {
         models::gptoss::gptoss::OssHp::from_meta(&f.metadata)?.n_layer as u32
     };

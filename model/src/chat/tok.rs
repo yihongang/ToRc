@@ -422,12 +422,15 @@ impl Bpe {
         let m = Meta::parse(&f.metadata)?;
         let model = m.str("tokenizer.ggml.model").unwrap_or("");
         let pre = m.str("tokenizer.ggml.pre").unwrap_or("");
-        let gpt4o = (model, pre) == ("gpt2", "gpt-4o");
+        let gpt4o = (model, pre) == ("gpt2", "gpt-4o") || (model, pre) == ("gpt2", "inkling2");
         let (gpt2, marks) = match (model, pre) {
             ("gpt2", "qwen35") => (true, true),
-            ("gpt2", "qwen2") | ("gpt2", "glm4") | ("gpt2", "lfm2") | ("gpt2", "kimi-k2") | ("gpt2", "gpt-4o") => {
-                (true, false)
-            }
+            ("gpt2", "qwen2")
+            | ("gpt2", "glm4")
+            | ("gpt2", "lfm2")
+            | ("gpt2", "kimi-k2")
+            | ("gpt2", "gpt-4o")
+            | ("gpt2", "inkling2") => (true, false),
             ("gemma4", _) | ("llama", _) => (false, false),
             _ => return err(format!("tokenizer {model}/{pre}: not built in ToRc yet")),
         };

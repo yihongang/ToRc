@@ -474,6 +474,19 @@ mod tests {
         (dir, src, dst)
     }
 
+    /// Inkling 2's mainline architecture converts through the same generic expert path; its loop tensors are ordinary
+    /// resident tensors, so the file round-trips like any other MoE.
+    #[test]
+    fn inkling2_loop_converts() {
+        let (dir, src, dst) = tiny("inkling2_loop", false);
+        let m = read::Model::open(&dst).unwrap();
+        assert_eq!(m.header.arch, "inkling2_loop");
+        assert_eq!(m.experts[0].width, 768);
+        check::check(&dst).unwrap();
+        check::check_against(&dst, &src).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn widened_experts_and_dense() {
         let (dir, src, dst) = tiny("gemma4", false);
