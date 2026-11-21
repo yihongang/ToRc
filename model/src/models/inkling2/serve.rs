@@ -99,6 +99,12 @@ impl Serve for Engine {
         }
         self.kept = 0;
         self.replies += 1;
+        // the experts used so far go into this machine's usage file, so the next load can put the hottest on the NPU
+        // (npu.rs: with no expert cache the tier counts the routes itself)
+        match &self.m.w.cache {
+            Some(c) => c.usage_flush(),
+            None => crate::npu::usage_flush(&self.m.w, self.m.h.n_layer, self.m.h.n_expert),
+        }
         let reply = Reply { prompt: ids.len(), output: n, reasoning: reasoning_tokens, finish, calls };
         self.timed = (ids.len(), read_secs, first, n, write_secs);
         Ok(reply)
@@ -119,6 +125,8 @@ impl Serve for Engine {
 
 /// Loads an Inkling 2 file for torc-server.
 pub fn open(path: &str, ctx: usize, name: Option<String>) -> Box<dyn Serve> {
+    // on one machine the NPU's hot experts come from this machine's own use of the model (npu.rs)
+    crate::npu::own_usage(!crate::switches::given("TORC_PIPE"));
     let m = Inkling::load(path, ctx).unwrap_or_else(|e| {
         eprintln!("torc-server: {e}");
         std::process::exit(1)

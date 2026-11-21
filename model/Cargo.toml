@@ -59,6 +59,10 @@ name = "torc-gpubench"
 path = "src/bin/dev/torc-gpubench.rs"
 
 [[bin]]
+name = "torc-inkling"
+path = "src/bin/dev/torc-inkling.rs"
+
+[[bin]]
 name = "torc-kl"
 path = "src/bin/dev/torc-kl.rs"
 

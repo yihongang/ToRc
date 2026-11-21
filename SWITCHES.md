@@ -88,13 +88,14 @@ The switches are read once, when the program starts, so changing one means start
 
 | Switch | Kind | What it does |
 |---|---|---|
-| `TORC_NPU`, `TORC_NPU_DIR`, `TORC_GEMMA_NPU` | setting | turns the NPU tier on (changes output: not bit-exact, prompts only; `pure` runs Gemma 4 whole on the NPU); where the ggml build is; Gemma's NPU parts |
-| `TORC_NPU_MIN_N`, `TORC_NPU_BLOCK`, `TORC_NPU_GROUP` | development | smallest block for the NPU; longest block per graph; layers per buffer (Gemma 4 whole on the NPU) |
+| `TORC_NPU`, `TORC_NPU_DIR`, `TORC_GEMMA_NPU` | setting | turns the NPU tier on (changes output: not bit-exact, prompts only; Inkling 2's hot routed experts can go up too but measured 0.27x the CPU at one token, so leave them off; `pure` runs Gemma 4 whole on the NPU); where the ggml build is; Gemma's NPU parts |
+| `TORC_NPU_MIN_N`, `TORC_NPU_BLOCK`, `TORC_NPU_GROUP` | development | smallest block for the NPU (Inkling 2 needs `1`, its blocks are one token, and they measured slower there); longest block per graph; layers per buffer (Gemma 4 whole on the NPU) |
 | `TORC_NPU_DEV`, `TORC_NPU_BUF_MB` | development | the ggml device to open, by name (default `HTP0`); the largest NPU weight buffer in MiB (default 256 on Linux, `0` one buffer, the Windows default) |
 | `TORC_NPU_MAX_MB` | development | the most weight bytes to put on the NPU, in MiB (default `0`, no limit): what is past it stays on the CPU. For a Linux driver that maps the NPU's buffers inside a small address window |
 | `TORC_NPU_PROFILE`, `TORC_NPU_HOT`, `TORC_NPU_HOT_MIN`, `TORC_NPU_PAD` | setting: `TORC_NPU_PROFILE`, `TORC_NPU_HOT`; the rest development | hot experts on the NPU: a usage file to take them from (default on one machine: the one this machine keeps for the model), how many a layer (16, or 32 on one machine with the Qwen3.6-35B and the other Qwen3.5 / 3.6 MoE models when the whole model fits with 8 GB to spare; `0` none) |
 | `TORC_NPU_ASYNC`, `TORC_NPU_GUIDED`, `TORC_NPU_WARM`, `TORC_NPU_Q8`, `TORC_NPU_HEAD`, `TORC_NPU_HELPER_PRIO` | development | scheduling and form of the NPU work |
 | `TORC_NPU_SHARED` | development | `0` keeps the shared expert on the CPU |
+| `TORC_INKLING_MOE_PAR` | development | `0` runs Inkling 2's routed experts one at a time on the calling thread instead of one thread an expert (the bits are the same either way) |
 
 ## GPU (Vulkan, through wgpu; in the release zips, or built with the `gpu` feature)
 

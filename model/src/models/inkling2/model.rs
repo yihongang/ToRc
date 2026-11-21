@@ -13,6 +13,12 @@ use crate::weights::{TensorRef, Weights};
 use format::{Result, err};
 use kernels::{Q8, QK, ops as kops};
 
+/// TORC_PROF=1 phase times for Inkling 2's forward pass, summed over every layer visit and every generated token:
+/// where a token's time goes. `torc-inkling` prints the table; `-` phases are the ones a run does not use.
+pub static INK_PHASES: [&str; 11] =
+    ["embed", "inputs", "qkv", "conv k/v", "attend", "attn out", "ffn mix", "experts", "ffn conv", "final mix", "head"];
+pub static INK_NS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
 /// A matrix-vector product's input quantised to Q8_K, reused across calls.
 struct Q8Buf(Q8);
 
@@ -271,6 +277,15 @@ impl Inkling {
         for l in 0..h.n_layer {
             layers.push(std::sync::Arc::new(LayerW::load(&w, &h, l)?));
         }
+        // TORC_NPU=1: the routed experts' hot set goes on the NPU (npu.rs). The attention products, the short
+        // convolutions and the loop control stay on the CPU, so only the experts are uploaded
+        crate::npu::load_experts_only(&w, h.n_layer, &groups);
+        if crate::npu::up() && crate::npu::min_tokens() > 1 {
+            // one token is all this model ever has; at that size the NPU measured 0.27x the CPU (AGENTS.md section 5)
+            eprintln!(
+                "npu: Inkling 2 reads one token at a time; its experts measured slower on the NPU (TORC_NPU_MIN_N=1 would take them)"
+            );
+        }
         let tok_norm = to_f32(&w.need("token_embd_norm.weight")?)?;
         let out_norm = to_f32(&w.need("output_norm.weight")?)?;
         let out_query = to_f32(&w.need("output_res_query.weight")?)?;
@@ -348,7 +363,9 @@ impl Inkling {
         if pos as usize >= self.ctx {
             return err(format!("position {pos} is past the context of {}", self.ctx));
         }
+        let mut l = crate::Laps::start(&INK_NS);
         let mut cur = self.embed(token)?;
+        l.lap(0);
         let mut blocks: Vec<Vec<f32>> = Vec::new();
         let mut prelude: Option<(Vec<f32>, Vec<Vec<f32>>)> = None;
         let mut bank: Option<(Vec<Vec<f32>>, Vec<f32>)> = None;
@@ -374,11 +391,13 @@ impl Inkling {
             } else {
                 None
             };
-            cur = self.layer(visit, ip, cur, &mut blocks, messages.as_ref(), pos, &mut qbuf)?;
+            cur = self.layer(visit, ip, cur, &mut blocks, messages.as_ref(), pos, &mut qbuf, &mut l)?;
         }
         let mixed = mix(&blocks, &cur, &self.out_query, 1, self.h.eps);
         let x = rms(&mixed[..self.h.n_embd as usize], &self.out_norm, self.h.eps);
+        l.lap(9);
         self.head(&x, logits, &mut qbuf)?;
+        l.lap(10);
         if self.h.softcap > 0.0 {
             let c = self.h.softcap;
             for l in logits.iter_mut() {
@@ -398,6 +417,7 @@ impl Inkling {
         messages: Option<&Vec<f32>>,
         pos: u32,
         qbuf: &mut Q8Buf,
+        lap: &mut crate::Laps,
     ) -> Result<Vec<f32>> {
         let l = self.h.layer_of(visit);
         let lw = self.layers[l as usize].clone();
@@ -442,6 +462,7 @@ impl Inkling {
             inputs[2] = rms(&inputs[2], &lw.v_norm, self.h.eps);
         }
 
+        lap.lap(1);
         let mut q = vec![0.0f32; nh * hd];
         let mut kcur = vec![0.0f32; dkv];
         let mut vcur = vec![0.0f32; dkv];
@@ -464,6 +485,7 @@ impl Inkling {
             matvec(&self.w.layer(l, "attn_v_conv_proj.weight")?, &inputs[2], qbuf, &mut d);
             Some(d)
         };
+        lap.lap(2);
         let mut kk = {
             let conv = &mut self.conv[visit as usize];
             conv.run(0, &kcur, &lw.k_conv, dyn_k.as_deref(), nkv, k)
@@ -502,6 +524,7 @@ impl Inkling {
                 *v *= tau;
             }
         }
+        lap.lap(3);
         let mut gate = vec![0.0f32; nh * hd];
         matvec(&self.w.layer(l, "attn_gate.weight")?, &inputs[0], qbuf, &mut gate);
         let mut sink = vec![0.0f32; nh];
@@ -513,6 +536,7 @@ impl Inkling {
         for i in 0..nh * hd {
             out[i] = att[i] * sigmoid(gate[i]);
         }
+        lap.lap(4);
         let mut o = vec![0.0f32; dm];
         matvec(&self.w.layer(l, "attn_output.weight")?, &out, qbuf, &mut o);
         let a = {
@@ -525,6 +549,7 @@ impl Inkling {
         } else {
             cur = inp_sa.iter().zip(&a).map(|(x, y)| x + y).collect();
         }
+        lap.lap(5);
         let ffn_inp = cur.clone();
         let mut ffn = mix(blocks, &cur, &lw.ffn_res_query, 1, self.h.eps)[..dm].to_vec();
         if let Some(m) = messages {
@@ -541,12 +566,16 @@ impl Inkling {
             );
         }
         ffn = rms(&ffn, &lw.ffn_norm, self.h.eps);
+        lap.lap(6);
         let m = self.moe(l, &ffn, qbuf)?;
+        lap.lap(7);
         let m = {
             let conv = &mut self.conv[visit as usize];
             conv.run(3, &m, &lw.f_conv, None, nkv, k)
         };
-        Ok(ffn_inp.iter().zip(&m).map(|(x, y)| x + y).collect())
+        let r = ffn_inp.iter().zip(&m).map(|(x, y)| x + y).collect();
+        lap.lap(8);
+        Ok(r)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -629,7 +658,8 @@ impl Inkling {
         Ok(out)
     }
 
-    fn moe(&self, l: u32, x: &[f32], qbuf: &mut Q8Buf) -> Result<Vec<f32>> {
+    /// The router's sigmoid probabilities, the top-k over them with their bias, and the routing sum.
+    fn route(&self, l: u32, x: &[f32]) -> (Vec<f32>, f32, Vec<(u32, f32)>) {
         let dm = self.h.n_embd as usize;
         let lw = &self.layers[l as usize];
         let mut logits = vec![0.0f32; self.h.n_expert as usize];
@@ -641,37 +671,257 @@ impl Inkling {
         let mut chosen = crate::ops::top_k(&sel, self.h.n_used as usize);
         chosen.sort_unstable_by_key(|x| x.0);
         let sum: f32 = chosen.iter().map(|&(e, _)| probs[e as usize]).sum::<f32>() + 1e-20;
-        let mut out = vec![0.0f32; dm];
+        (probs, sum, chosen)
+    }
+
+    fn moe(&self, l: u32, x: &[f32], qbuf: &mut Q8Buf) -> Result<Vec<f32>> {
+        let (probs, sum, chosen) = self.route(l, x);
+        // this token's routes for the NPU tier's expert-use count (npu.rs; the usage file and TORC_ROUTES)
+        if crate::npu::counting_on() {
+            let r: Vec<(usize, f32)> = chosen.iter().map(|&(e, p)| (e as usize, p)).collect();
+            crate::npu::record(l, std::slice::from_ref(&r));
+        }
+        // the NPU tier: an expert of the layer's hot set has its gate and up run on the NPU, its SiTU on the CPU and
+        // its down on the NPU again, while the CPU runs the experts the NPU does not hold. With no hot expert chosen
+        // (or the tier down) this is the CPU path exactly as it was.
+        let hot: Vec<Option<[i32; 3]>> = chosen.iter().map(|&(e, _)| crate::npu::hot_of(l, e as usize, 1)).collect();
+        if hot.iter().any(Option::is_some) {
+            return self.moe_staged(l, x, qbuf, &chosen, &probs, sum, &hot);
+        }
+        self.moe_cpu(l, x, qbuf, &chosen, &probs, sum, &[])
+    }
+
+    /// The CPU's share of a token's route: each chosen expert's gate, up, SiTU and down, added to the output with its
+    /// routing weight, in increasing expert id. This is the path the model has always taken; `skip` marks the experts
+    /// the NPU took (the staged path's, which run there instead).
+    ///
+    /// One expert's matrices are 1.6 MiB, under `Mat::apply`'s 4 MiB rule, so an expert at a time would keep the whole
+    /// MoE on one core (about 1.8 ms a visit on a Snapdragon X, against 0.7 ms over the pool). The experts of a token
+    /// are independent, so they go over the pool one thread each, with the same `Mat::apply` calls an expert at a time
+    /// would make: every row is the same dot product whichever thread computes it, and the sum is still made in
+    /// increasing expert id below, so the bits are the CPU path's.
+    fn moe_cpu(
+        &self,
+        l: u32,
+        x: &[f32],
+        qbuf: &mut Q8Buf,
+        chosen: &[(u32, f32)],
+        probs: &[f32],
+        sum: f32,
+        skip: &[bool],
+    ) -> Result<Vec<f32>> {
+        let dm = self.h.n_embd as usize;
         let group = self.groups[l as usize];
         let width = self.w.layer_experts(group).width as usize;
+        let (beta, lb) = (self.h.situ_beta, self.h.situ_linear_beta);
+        let mut out = vec![0.0f32; dm];
+        // the experts this path runs, in increasing id
+        let idx: Vec<usize> = (0..chosen.len()).filter(|&i| !skip.get(i).copied().unwrap_or(false)).collect();
+        if idx.is_empty() {
+            return Ok(out);
+        }
+        // the expert cache keeps only its layer's slots live, so its experts are asked for a group at a time and
+        // computed before the next ask (without one, all of them come at once from the mapping)
+        let per = self.w.cache.as_ref().map_or(usize::MAX, |c| c.layer_slots(l).clamp(1, 64));
+        let kk = idx.len();
+        // TORC_INKLING_MOE_PAR=0: one expert at a time on the calling thread, the way the model ran before the
+        // experts were spread over the pool (an A/B). One expert has nothing to spread
+        static PAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| crate::switches::get("TORC_INKLING_MOE_PAR").is_none_or(|v| v != "0"));
+        if kk == 1 || !*PAR {
+            let mut g = vec![0.0f32; width];
+            let mut u = vec![0.0f32; width];
+            let mut h = vec![0.0f32; width];
+            let mut d = vec![0.0f32; dm];
+            for &i in &idx {
+                let e = chosen[i].0 as usize;
+                let weight = probs[e] / sum * self.h.route_scale;
+                self.expert_cpu(l, e, weight, x, qbuf, &mut out, &mut g, &mut u, &mut h, &mut d)?;
+            }
+            return Ok(out);
+        }
+        let mut gu = crate::scratch::buf::<f32>("inkling.moe_gu", 2 * kk * width);
+        let mut hh = crate::scratch::buf::<f32>("inkling.moe_h", kk * width);
+        let mut dd = crate::scratch::buf::<f32>("inkling.moe_d", kk * dm);
+        for (c0, chunk) in idx.chunks(per).enumerate() {
+            let ids: Vec<u32> = chunk.iter().map(|&i| chosen[i].0).collect();
+            let packs = self.w.experts_of(l, group, &ids)?;
+            let mats: Vec<[Mat; 3]> = packs
+                .iter()
+                .map(|&(data, p)| {
+                    [&p.gate, &p.up, &p.down].map(|q| Mat {
+                        ty: q.ty,
+                        rows: q.rows as usize,
+                        cols: q.cols as usize,
+                        data: q.of(data),
+                    })
+                })
+                .collect();
+            let (g0, h0, d0) = (2 * c0 * width, c0 * width, c0 * dm);
+            let (gp, hp, dp) = (
+                crate::pool::SyncPtr::new(&mut gu),
+                crate::pool::SyncPtr::new(&mut hh),
+                crate::pool::SyncPtr::new(&mut dd),
+            );
+            let (gp, hp, dp) = (&gp, &hp, &dp);
+            crate::pool::par_for(mats.len(), &|j| {
+                // each job quantises its own copies of the token's vector and of its hidden, from this thread's own
+                // scratch, so nothing is shared but the read-only x
+                let mut qb = crate::scratch::q8("inkling.moe_q", dm.div_ceil(QK));
+                // SAFETY: job j owns its expert's gate, up and down slices of gu and dd, its hidden of hh, and its
+                // blocks of qb (which is this thread's own)
+                unsafe {
+                    let (gj, uj) = (gp.slice(g0 + 2 * j * width, width), gp.slice(g0 + (2 * j + 1) * width, width));
+                    kops::q8k_quantize(x, qb.sub_mut(0..dm / QK));
+                    mats[j][0].apply(qb.sub(0..dm / QK), gj);
+                    mats[j][1].apply(qb.sub(0..dm / QK), uj);
+                    let hj = hp.slice(h0 + j * width, width);
+                    for r in 0..width {
+                        hj[r] = situ(gj[r], uj[r], beta, lb);
+                    }
+                    kops::q8k_quantize(hj, qb.sub_mut(0..width / QK));
+                    mats[j][2].apply(qb.sub(0..width / QK), dp.slice(d0 + j * dm, dm));
+                }
+            });
+        }
+        // the routing weights, in increasing expert id (the order the per-token path added them)
+        for (j, &i) in idx.iter().enumerate() {
+            let weight = probs[chosen[i].0 as usize] / sum * self.h.route_scale;
+            for r in 0..dm {
+                out[r] += weight * dd[j * dm + r];
+            }
+        }
+        Ok(out)
+    }
+
+    /// One expert's whole FFN on the CPU, added to `out` with its routing weight: gate and up over the Q8 input, the
+    /// SiTU, then down over the quantised hidden. The g, u, h and d buffers are the caller's.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_cpu(
+        &self,
+        l: u32,
+        e: usize,
+        weight: f32,
+        x: &[f32],
+        qbuf: &mut Q8Buf,
+        out: &mut [f32],
+        g: &mut [f32],
+        u: &mut [f32],
+        h: &mut [f32],
+        d: &mut [f32],
+    ) -> Result<()> {
+        let dm = self.h.n_embd as usize;
+        let width = g.len();
+        let group = self.groups[l as usize];
+        let packs = self.w.experts_of(l, group, &[e as u32])?;
+        let (data, pack) = packs[0];
+        let gp = &pack.gate;
+        let up = &pack.up;
+        let dp = &pack.down;
+        let gd = &data[gp.at as usize..(gp.at + gp.bytes) as usize];
+        let ud = &data[up.at as usize..(up.at + up.bytes) as usize];
+        let dd = &data[dp.at as usize..(dp.at + dp.bytes) as usize];
+        let mg = Mat { ty: gp.ty, rows: gp.rows as usize, cols: gp.cols as usize, data: gd };
+        let mu = Mat { ty: up.ty, rows: up.rows as usize, cols: up.cols as usize, data: ud };
+        let md = Mat { ty: dp.ty, rows: dp.rows as usize, cols: dp.cols as usize, data: dd };
+        let q = qbuf.quant(x);
+        mg.apply(q, g);
+        mu.apply(q, u);
+        for i in 0..width {
+            h[i] = situ(g[i], u[i], self.h.situ_beta, self.h.situ_linear_beta);
+        }
+        let qh = qbuf.quant(h);
+        md.apply(qh, d);
+        for i in 0..dm {
+            out[i] += weight * d[i];
+        }
+        Ok(())
+    }
+
+    /// The NPU tier's share of a token's route, with the rest on the CPU. The hot experts' gate and up products go up
+    /// as one graph while the CPU runs the experts it keeps; their SiTU is the CPU's, then their down products go up as
+    /// a second graph. Their outputs are added after the CPU experts', in increasing expert id.
+    ///
+    /// The tier is not bit-exact (f32 activations, the HTP's own sums), so this only runs with TORC_NPU=1: with it off
+    /// [`crate::npu::hot_of`] returns None for every expert and the CPU path is the only one taken.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_staged(
+        &self,
+        l: u32,
+        x: &[f32],
+        qbuf: &mut Q8Buf,
+        chosen: &[(u32, f32)],
+        probs: &[f32],
+        sum: f32,
+        hot: &[Option<[i32; 3]>],
+    ) -> Result<Vec<f32>> {
+        let dm = self.h.n_embd as usize;
+        let group = self.groups[l as usize];
+        let width = self.w.layer_experts(group).width as usize;
+        // (index in chosen) of the experts the NPU holds
+        let npu: Vec<usize> = (0..chosen.len()).filter(|&i| hot[i].is_some()).collect();
+        let mut gu = crate::scratch::buf::<f32>("inkling.moe_gu", npu.len() * 2 * width);
+        let mut hh = crate::scratch::buf::<f32>("inkling.moe_h", npu.len() * width);
+        let mut dd = crate::scratch::buf::<f32>("inkling.moe_d", npu.len() * dm);
+        let ups: Vec<crate::npu::GateUp> = npu
+            .iter()
+            .enumerate()
+            .map(|(j, &i)| {
+                let ids = hot[i].expect("a hot expert's ids");
+                crate::npu::GateUp {
+                    ids: [ids[0], ids[1]],
+                    x: x.as_ptr(),
+                    n: 1,
+                    g: gu[j * 2 * width..].as_mut_ptr(),
+                    u: gu[(j * 2 + 1) * width..].as_mut_ptr(),
+                }
+            })
+            .collect();
+        // SAFETY: x holds dm floats, which begin copies in; gu holds each expert's gate and up rows until finish
+        let started = unsafe { crate::npu::begin_gate_up(&ups, dm) };
+        let skip: Vec<bool> = hot.iter().map(Option::is_some).collect();
+        let cpu = self.moe_cpu(l, x, qbuf, chosen, probs, sum, &skip);
+        // the graph is waited for before anything else, so a failed CPU expert leaves nothing in flight
+        let mut down = started && crate::npu::finish();
+        let mut out = cpu?;
+        if down {
+            for (j, _) in npu.iter().enumerate() {
+                let (g, u) = (&gu[j * 2 * width..j * 2 * width + width], &gu[(j * 2 + 1) * width..(j * 2 + 2) * width]);
+                for r in 0..width {
+                    hh[j * width + r] = situ(g[r], u[r], self.h.situ_beta, self.h.situ_linear_beta);
+                }
+            }
+            let downs: Vec<crate::npu::Down> = npu
+                .iter()
+                .enumerate()
+                .map(|(j, &i)| crate::npu::Down {
+                    id: hot[i].expect("a hot expert's ids")[2],
+                    x: hh[j * width..].as_ptr(),
+                    n: 1,
+                    d: dd[j * dm..].as_mut_ptr(),
+                })
+                .collect();
+            // SAFETY: hh holds each expert's hidden rows (begin copies them in), and dd its output rows, until finish
+            down = unsafe { crate::npu::begin_down(&downs, width) } && crate::npu::finish();
+        }
+        if down {
+            for (j, &i) in npu.iter().enumerate() {
+                let weight = probs[chosen[i].0 as usize] / sum * self.h.route_scale;
+                for r in 0..dm {
+                    out[r] += weight * dd[j * dm + r];
+                }
+            }
+            return Ok(out);
+        }
+        // the NPU did not take them after all: their own CPU chain, after the experts it kept
         let mut g = vec![0.0f32; width];
         let mut u = vec![0.0f32; width];
         let mut h = vec![0.0f32; width];
         let mut d = vec![0.0f32; dm];
-        for (e, _) in chosen {
-            let weight = probs[e as usize] / sum * self.h.route_scale;
-            let packs = self.w.experts_of(l, group, &[e])?;
-            let (data, pack) = packs[0];
-            let gp = &pack.gate;
-            let up = &pack.up;
-            let dp = &pack.down;
-            let gd = &data[gp.at as usize..(gp.at + gp.bytes) as usize];
-            let ud = &data[up.at as usize..(up.at + up.bytes) as usize];
-            let dd = &data[dp.at as usize..(dp.at + dp.bytes) as usize];
-            let mg = Mat { ty: gp.ty, rows: gp.rows as usize, cols: gp.cols as usize, data: gd };
-            let mu = Mat { ty: up.ty, rows: up.rows as usize, cols: up.cols as usize, data: ud };
-            let md = Mat { ty: dp.ty, rows: dp.rows as usize, cols: dp.cols as usize, data: dd };
-            let q = qbuf.quant(x);
-            mg.apply(q, &mut g);
-            mu.apply(q, &mut u);
-            for i in 0..width {
-                h[i] = situ(g[i], u[i], self.h.situ_beta, self.h.situ_linear_beta);
-            }
-            let qh = qbuf.quant(&h);
-            md.apply(qh, &mut d);
-            for i in 0..dm {
-                out[i] += weight * d[i];
-            }
+        for &i in &npu {
+            let e = chosen[i].0 as usize;
+            let weight = probs[e] / sum * self.h.route_scale;
+            self.expert_cpu(l, e, weight, x, qbuf, &mut out, &mut g, &mut u, &mut h, &mut d)?;
         }
         Ok(out)
     }

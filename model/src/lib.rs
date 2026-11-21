@@ -72,13 +72,14 @@ impl Laps {
 pub type PhaseTable = (&'static str, &'static [&'static str], &'static [AtomicU64]);
 
 /// The phase tables.
-pub fn phase_tables() -> [PhaseTable; 5] {
+pub fn phase_tables() -> [PhaseTable; 6] {
     [
         ("moe", &moe::MOE_PHASES, &moe::MOE_NS),
         ("moe 1 token", &moe::MOE1_PHASES, &moe::MOE1_NS),
         ("attention", &attn::ATTN_PHASES, &attn::ATTN_NS),
         ("deltanet", &rec::REC_PHASES, &rec::REC_NS),
         ("mixers", &hc::HC_PHASES, &hc::HC_NS),
+        ("inkling", &crate::models::inkling2::model::INK_PHASES, &crate::models::inkling2::model::INK_NS),
     ]
 }
 

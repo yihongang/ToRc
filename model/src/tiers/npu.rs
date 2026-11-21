@@ -10,6 +10,13 @@
 //! the output is byte-identical to the CPU engine. With it on, the prompt's products are the NPU's (on f32 activations,
 //! which are closer to an f64 product than the CPU's Q8 ones: see npucheck), so the result is checked by tolerance
 //! against the CPU path rather than by bytes.
+//!
+//! Inkling 2 reads a token at a time and has no shared expert, so [`load_experts_only`] uploads just its hot experts,
+//! and inkling2/model.rs runs each of them through [`begin_gate_up`], its own SiTU on the CPU and [`begin_down`]: the
+//! attention, the short convolutions and the loop control stay on the CPU. It needs TORC_NPU_MIN_N=1 (a block of one
+//! token is all it ever has), and it measured slower there than on the CPU (0.27x a visit at one token: AGENTS.md
+//! section 5), because at that size both sides are reading weights and the CPU's IQ4_NL stream is half the NPU's Q8_0
+//! copies at twice the bandwidth. `npucheck ... experts` re-measures it.
 
 use crate::moe::Mat;
 
@@ -23,9 +30,95 @@ pub struct Ffn {
     pub y: *mut f32,
 }
 
+/// One expert's gate and up for [`begin_gate_up`]: their NPU ids, n f32 input rows of the expert's cols at x, and the
+/// outputs [n][rows of gate] at g and [n][rows of up] at u. It is the first half of an expert for a model whose
+/// activation is the CPU's (Inkling 2's SiTU): the CPU applies it, then [`begin_down`] runs the other half.
+#[derive(Clone, Copy)]
+pub struct GateUp {
+    pub ids: [i32; 2],
+    pub x: *const f32,
+    pub n: usize,
+    pub g: *mut f32,
+    pub u: *mut f32,
+}
+
+/// One expert's down for [`begin_down`]: its NPU id, n f32 rows of its hidden (the CPU's activation output) at x, and
+/// the outputs [n][rows of down] at d.
+#[derive(Clone, Copy)]
+pub struct Down {
+    pub id: i32,
+    pub x: *const f32,
+    pub n: usize,
+    pub d: *mut f32,
+}
+
+/// [`to_q8_0`] for callers outside the tier (npucheck measures the exact bytes the tier uploads).
+pub fn q8_0_copy(m: &Mat) -> Vec<u8> {
+    to_q8_0(m)
+}
+
+/// A matrix's rows as Q8_0: dequantised, then per 32 weights d = amax / 127 (as fp16) and q = round-to-even(v / d).
+/// This is lossy, so it is only for a type the NPU does not take (the 35B's Q4_1 downs); IQ4_NL (Flash Next's
+/// experts) converts exactly instead.
+fn to_q8_0(m: &Mat) -> Vec<u8> {
+    let rb = m.data.len() / m.rows;
+    let ob = m.cols / 32 * 34;
+    let mut out = vec![0u8; m.rows * ob];
+    if m.ty == kernels::mix::IQ4_NL {
+        // exact: the block's fp16 scale as it is, and each code as its int8 value (the low nibble of qs[j] is
+        // weight j and its high nibble weight j + 16, as ggml dequantises IQ4_NL)
+        let kv = kernels::mix::KVALUES_IQ4NL;
+        for r in 0..m.rows {
+            let src = &m.data[r * rb..(r + 1) * rb];
+            for (b, o) in out[r * ob..(r + 1) * ob].chunks_exact_mut(34).enumerate() {
+                let s = &src[b * 18..b * 18 + 18];
+                o[..2].copy_from_slice(&s[..2]);
+                for j in 0..16 {
+                    o[2 + j] = kv[(s[2 + j] & 15) as usize] as u8;
+                    o[2 + 16 + j] = kv[(s[2 + j] >> 4) as usize] as u8;
+                }
+            }
+        }
+        return out;
+    }
+    if m.ty == 6 {
+        // Q5_0, exact: the block's fp16 scale as it is, and each weight q - 16 (its five bits less 16) as an int8
+        for r in 0..m.rows {
+            let src = &m.data[r * rb..(r + 1) * rb];
+            for (b, o) in out[r * ob..(r + 1) * ob].chunks_exact_mut(34).enumerate() {
+                let s = &src[b * 22..b * 22 + 22];
+                o[..2].copy_from_slice(&s[..2]);
+                let qh = u32::from_le_bytes([s[2], s[3], s[4], s[5]]);
+                for j in 0..16 {
+                    let lo = (s[6 + j] & 15) | ((qh >> j) as u8 & 1) << 4;
+                    let hi = (s[6 + j] >> 4) | ((qh >> (j + 16)) as u8 & 1) << 4;
+                    o[2 + j] = (lo as i8 - 16) as u8;
+                    o[2 + 16 + j] = (hi as i8 - 16) as u8;
+                }
+            }
+        }
+        return out;
+    }
+    let mut f = vec![0f32; m.cols];
+    for r in 0..m.rows {
+        kernels::ops::dequantize(m.ty, &m.data[r * rb..(r + 1) * rb], &mut f);
+        for (b, o) in out[r * ob..(r + 1) * ob].chunks_exact_mut(34).enumerate() {
+            let v = &f[b * 32..b * 32 + 32];
+            let amax = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
+            let d = amax / 127.0;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            o[..2].copy_from_slice(&kernels::ops::fp32_to_fp16(d).to_le_bytes());
+            for i in 0..32 {
+                o[2 + i] = (v[i] * id).round_ties_even() as i32 as i8 as u8;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 mod imp {
-    use super::{Ffn, Mat};
+    use super::{Down, Ffn, GateUp, Mat};
     use crate::weights::Weights;
     use kernels::npu::{Npu, NpuGroup, NpuMm, configure};
     use std::collections::HashMap;
@@ -61,65 +154,6 @@ mod imp {
         "ffn_down.weight",
     ];
 
-    /// A matrix's rows as Q8_0: dequantised, then per 32 weights d = amax / 127 (as fp16) and q = round-to-even(v / d).
-    /// This is lossy, so it is only for a type the NPU does not take (the 35B's Q4_1 downs); IQ4_NL (Flash Next's
-    /// experts) converts exactly instead.
-    fn to_q8_0(m: &Mat) -> Vec<u8> {
-        let rb = m.data.len() / m.rows;
-        let ob = m.cols / 32 * 34;
-        let mut out = vec![0u8; m.rows * ob];
-        if m.ty == kernels::mix::IQ4_NL {
-            // exact: the block's fp16 scale as it is, and each code as its int8 value (the low nibble of qs[j] is
-            // weight j and its high nibble weight j + 16, as ggml dequantises IQ4_NL)
-            let kv = kernels::mix::KVALUES_IQ4NL;
-            for r in 0..m.rows {
-                let src = &m.data[r * rb..(r + 1) * rb];
-                for (b, o) in out[r * ob..(r + 1) * ob].chunks_exact_mut(34).enumerate() {
-                    let s = &src[b * 18..b * 18 + 18];
-                    o[..2].copy_from_slice(&s[..2]);
-                    for j in 0..16 {
-                        o[2 + j] = kv[(s[2 + j] & 15) as usize] as u8;
-                        o[2 + 16 + j] = kv[(s[2 + j] >> 4) as usize] as u8;
-                    }
-                }
-            }
-            return out;
-        }
-        if m.ty == 6 {
-            // Q5_0, exact: the block's fp16 scale as it is, and each weight q - 16 (its five bits less 16) as an int8
-            for r in 0..m.rows {
-                let src = &m.data[r * rb..(r + 1) * rb];
-                for (b, o) in out[r * ob..(r + 1) * ob].chunks_exact_mut(34).enumerate() {
-                    let s = &src[b * 22..b * 22 + 22];
-                    o[..2].copy_from_slice(&s[..2]);
-                    let qh = u32::from_le_bytes([s[2], s[3], s[4], s[5]]);
-                    for j in 0..16 {
-                        let lo = (s[6 + j] & 15) | ((qh >> j) as u8 & 1) << 4;
-                        let hi = (s[6 + j] >> 4) | ((qh >> (j + 16)) as u8 & 1) << 4;
-                        o[2 + j] = (lo as i8 - 16) as u8;
-                        o[2 + 16 + j] = (hi as i8 - 16) as u8;
-                    }
-                }
-            }
-            return out;
-        }
-        let mut f = vec![0f32; m.cols];
-        for r in 0..m.rows {
-            kernels::ops::dequantize(m.ty, &m.data[r * rb..(r + 1) * rb], &mut f);
-            for (b, o) in out[r * ob..(r + 1) * ob].chunks_exact_mut(34).enumerate() {
-                let v = &f[b * 32..b * 32 + 32];
-                let amax = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
-                let d = amax / 127.0;
-                let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-                o[..2].copy_from_slice(&kernels::ops::fp32_to_fp16(d).to_le_bytes());
-                for i in 0..32 {
-                    o[2 + i] = (v[i] * id).round_ties_even() as i32 as i8 as u8;
-                }
-            }
-        }
-        out
-    }
-
     /// Reads a usage file (the expert cache's, or one from TORC_NPU_PROFILE_OUT; EXPERT-CACHE.md) as counts
     /// [n_layer][n_expert], whichever model file wrote it.
     fn read_profile(path: &str, n_layer: usize, ne: usize) -> Result<Vec<u32>, String> {
@@ -133,9 +167,16 @@ mod imp {
         crate::pipe::own_layers(n_layer as usize).map_or(0..n_layer, |(a, b)| a as u32..b as u32)
     }
 
-    /// Builds the tier: the dense products and, with k > 0, the k most used experts of each layer (by the profile).
-    /// On a pipeline only this machine's layers go up: the others' are never run here.
-    fn build(w: &Weights, n_layer: u32, groups: &[u32], k: usize, profile: &[u32]) -> Result<Tier, String> {
+    /// Builds the tier: the dense products (with_dense) and, with k > 0, the k most used experts of each layer (by the
+    /// profile). On a pipeline only this machine's layers go up: the others' are never run here.
+    fn build(
+        w: &Weights,
+        n_layer: u32,
+        groups: &[u32],
+        k: usize,
+        profile: &[u32],
+        with_dense: bool,
+    ) -> Result<Tier, String> {
         let mut npu = match Npu::create() {
             Ok(Some(p)) => p,
             Ok(None) => return Err(String::new()),
@@ -146,13 +187,13 @@ mod imp {
         // Q8_0 copies of matrices the NPU cannot take as they are, kept until the upload
         let mut conv: Vec<Vec<u8>> = Vec::new();
         for l in own.clone() {
-            for name in DENSE {
+            for name in if with_dense { &DENSE[..] } else { &[] } {
                 if let Some(t) = w.tensor(&format!("blk.{l}.{name}")) {
                     let (cols, rows) = t.shape();
                     // a Q5_0 matrix (a GGUF's shared experts) goes up as its exact Q8_0 copy, still found by the mapped
                     // matrix's address
                     let (ty, ptr) = if t.t.ty == 6 {
-                        conv.push(to_q8_0(&Mat { ty: 6, rows, cols, data: t.data }));
+                        conv.push(super::to_q8_0(&Mat { ty: 6, rows, cols, data: t.data }));
                         (8, conv.last().unwrap().as_ptr())
                     } else {
                         (t.t.ty, t.data.as_ptr())
@@ -200,7 +241,7 @@ mod imp {
                     if matches!(mx.ty, 2 | 8 | 14) && !copy {
                         (mx.ty, mx.data.as_ptr())
                     } else {
-                        conv.push(to_q8_0(mx));
+                        conv.push(super::to_q8_0(mx));
                         (8, conv.last().unwrap().as_ptr())
                     }
                 };
@@ -218,6 +259,11 @@ mod imp {
                 }
             }
             hot[l].sort_by_key(|h| h.0);
+        }
+        // nothing recorded: a model that has no dense products here and whose hot experts the profile has not named
+        // yet (the first session counts them, and the next one takes them)
+        if pending.is_empty() && hot.iter().all(Vec::is_empty) {
+            return Err("nothing to upload yet; the first session counts the experts".to_string());
         }
         let (bytes, secs) = npu.upload().map_err(|()| "upload failed".to_string())?;
         drop(conv);
@@ -286,7 +332,7 @@ mod imp {
         Ok(Tier { npu, ids, min_tokens, hot })
     }
 
-    pub fn load(w: &Weights, n_layer: u32, groups: &[u32]) {
+    pub fn load(w: &Weights, n_layer: u32, groups: &[u32], with_dense: bool) {
         if TIER.get().is_some() || !configure() {
             return;
         }
@@ -343,10 +389,10 @@ mod imp {
         // the count asked for, which a profile passes on: not the 0 a first session (no usage file yet) or a refused
         // file leaves. A dense model asks for its one expert a layer
         HOT_ASKED.store(if dense { k } else { asked }, std::sync::atomic::Ordering::Relaxed);
-        let t = match build(w, n_layer, groups, k, &profile) {
+        let t = match build(w, n_layer, groups, k, &profile, with_dense) {
             Err(e) if k > 0 && !e.is_empty() => {
                 eprintln!("npu: with {k} hot experts a layer: {e}; trying the dense products alone");
-                build(w, n_layer, groups, 0, &profile)
+                build(w, n_layer, groups, 0, &profile, with_dense)
             }
             r => r,
         };
@@ -420,6 +466,86 @@ mod imp {
         t.hot.get(layer as usize).cloned().unwrap_or_default()
     }
 
+    /// One expert's NPU ids when it is in the layer's hot set and n is a block the tier takes.
+    pub fn hot_of(layer: u32, expert: usize, n: usize) -> Option<[i32; 3]> {
+        let t = TIER.get()?.lock().unwrap();
+        if n < t.min_tokens {
+            return None;
+        }
+        let h = t.hot.get(layer as usize)?;
+        h.binary_search_by_key(&expert, |x| x.0).ok().map(|i| h[i].1)
+    }
+
+    /// Starts the gate and up products of every expert in f as one graph, each over its own input rows.
+    ///
+    /// # Safety
+    /// Each x holds n x cols floats until this returns (they are copied in). Each g and u holds n x rows-of-gate (or
+    /// -up) floats and must stay valid, and untouched by anything else, until finish returns. After a true return the
+    /// caller must call finish.
+    pub unsafe fn begin_gate_up(f: &[GateUp], cols: usize) -> bool {
+        let Some(t) = TIER.get() else { return false };
+        if f.is_empty() {
+            return false;
+        }
+        // one flat array of every group's products, which the groups point into (it outlives the begin call)
+        let mut mm: Vec<NpuMm> = Vec::with_capacity(2 * f.len());
+        for e in f {
+            mm.push(NpuMm { w: e.ids[0], y: e.g, y_stride: 0 });
+            mm.push(NpuMm { w: e.ids[1], y: e.u, y_stride: 0 });
+        }
+        let base = mm.as_ptr();
+        let g: Vec<NpuGroup> = f
+            .iter()
+            .enumerate()
+            .map(|(i, e)| NpuGroup {
+                x: e.x,
+                cols,
+                n: e.n,
+                // SAFETY: 2 * i is inside mm, which holds 2 per group
+                mm: unsafe { base.add(2 * i) },
+                n_mm: 2,
+                ffn: [-1; 3],
+                ffn_y: std::ptr::null_mut(),
+            })
+            .collect();
+        // SAFETY: the caller's contract (super::begin_gate_up)
+        unsafe { t.lock().unwrap().npu.begin(&g) }
+    }
+
+    /// Starts the down products of every expert in f as one graph, each over its own rows of hidden.
+    ///
+    /// # Safety
+    /// Each x holds n x cols floats until this returns (they are copied in). Each d holds n x rows-of-down floats and
+    /// must stay valid, and untouched by anything else, until finish returns. After a true return the caller must call
+    /// finish.
+    pub unsafe fn begin_down(f: &[Down], cols: usize) -> bool {
+        let Some(t) = TIER.get() else { return false };
+        if f.is_empty() {
+            return false;
+        }
+        let mut mm: Vec<NpuMm> = Vec::with_capacity(f.len());
+        for e in f {
+            mm.push(NpuMm { w: e.id, y: e.d, y_stride: 0 });
+        }
+        let base = mm.as_ptr();
+        let g: Vec<NpuGroup> = f
+            .iter()
+            .enumerate()
+            .map(|(i, e)| NpuGroup {
+                x: e.x,
+                cols,
+                n: e.n,
+                // SAFETY: i is inside mm, which holds one per group
+                mm: unsafe { base.add(i) },
+                n_mm: 1,
+                ffn: [-1; 3],
+                ffn_y: std::ptr::null_mut(),
+            })
+            .collect();
+        // SAFETY: the caller's contract (super::begin_down)
+        unsafe { t.lock().unwrap().npu.begin(&g) }
+    }
+
     pub unsafe fn begin_ffns(f: &[Ffn], cols: usize) -> bool {
         let Some(t) = TIER.get() else { return false };
         let g: Vec<NpuGroup> = f
@@ -437,12 +563,16 @@ mod imp {
     pub fn set_geglu() -> bool {
         TIER.get().is_some_and(|t| t.lock().unwrap().npu.set_geglu(true))
     }
+
+    pub fn min_tokens() -> usize {
+        TIER.get().map_or(0, |t| t.lock().unwrap().min_tokens)
+    }
 }
 
 #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux"))))]
 mod imp {
     use super::{Ffn, Mat};
-    pub fn load(_: &crate::weights::Weights, _: u32, _: &[u32]) {}
+    pub fn load(_: &crate::weights::Weights, _: u32, _: &[u32], _: bool) {}
     pub fn apply(_: &mut [(Mat, &mut [f32])], _: &[f32], _: usize) -> bool {
         false
     }
@@ -461,6 +591,15 @@ mod imp {
     pub fn hot(_: u32, _: usize) -> Vec<(usize, [i32; 3])> {
         Vec::new()
     }
+    pub fn hot_of(_: u32, _: usize, _: usize) -> Option<[i32; 3]> {
+        None
+    }
+    pub unsafe fn begin_gate_up(_: &[GateUp], _: usize) -> bool {
+        false
+    }
+    pub unsafe fn begin_down(_: &[Down], _: usize) -> bool {
+        false
+    }
     pub unsafe fn begin_ffns(_: &[Ffn], _: usize) -> bool {
         false
     }
@@ -470,12 +609,21 @@ mod imp {
     pub fn set_geglu() -> bool {
         false
     }
+    pub fn min_tokens() -> usize {
+        0
+    }
 }
 
-/// Uploads the dense products when TORC_NPU is set (ARM64 Windows), and, with TORC_NPU_PROFILE, the hot experts of each
-/// layer (groups[l] is layer l's EXPERTS record); otherwise does nothing.
+/// Uploads the dense products when TORC_NPU is set, and the hot experts of each layer (groups[l] is layer l's EXPERTS
+/// record); otherwise does nothing.
 pub fn load(w: &crate::weights::Weights, n_layer: u32, groups: &[u32]) {
-    imp::load(w, n_layer, groups)
+    imp::load(w, n_layer, groups, true)
+}
+
+/// [`load`] for a model whose attention and other dense products stay on the CPU (Inkling 2): only its hot experts go
+/// up, and [`begin_gate_up`] / [`begin_down`] run them.
+pub fn load_experts_only(w: &crate::weights::Weights, n_layer: u32, groups: &[u32]) {
+    imp::load(w, n_layer, groups, false)
 }
 
 /// The products y_j = W_j x over n f32 rows x (n x cols, with y_j[t * rows_j + r], as in apply_group_multi), on the
@@ -501,6 +649,34 @@ pub fn hot_asked() -> usize {
 /// up with hot experts and n >= min_tokens.
 pub fn hot(layer: u32, n: usize) -> Vec<(usize, [i32; 3])> {
     imp::hot(layer, n)
+}
+
+/// One expert's NPU ids (gate, up, down) when the tier is up, it is in layer `layer`'s hot set and n >= its min_tokens;
+/// None leaves the expert to the CPU.
+pub fn hot_of(layer: u32, expert: usize, n: usize) -> Option<[i32; 3]> {
+    imp::hot_of(layer, expert, n)
+}
+
+/// Starts the gate and up products of every expert in f as one graph, each over its own input rows; their outputs are
+/// written when [`finish`] returns. Returns false if nothing was started. The second half of an expert, for a model
+/// whose activation the CPU applies between the two (Inkling 2's SiTU), is [`begin_down`].
+///
+/// # Safety
+/// Each x holds n x cols floats until this returns (they are copied in). Each g and u holds n x rows-of-gate (or -up)
+/// floats and must stay valid, and untouched by anything else, until finish returns. After a true return the caller
+/// must call finish.
+pub unsafe fn begin_gate_up(f: &[GateUp], cols: usize) -> bool {
+    unsafe { imp::begin_gate_up(f, cols) }
+}
+
+/// Starts the down products of every expert in f as one graph, each over its own rows of hidden; their outputs are
+/// written when [`finish`] returns. Returns false if nothing was started.
+///
+/// # Safety
+/// Each x holds n x cols floats until this returns (they are copied in). Each d holds n x rows-of-down floats and must
+/// stay valid, and untouched by anything else, until finish returns. After a true return the caller must call finish.
+pub unsafe fn begin_down(f: &[Down], cols: usize) -> bool {
+    unsafe { imp::begin_down(f, cols) }
 }
 
 /// Starts the experts f in one graph (SwiGLU in f32 on the NPU), each over its own rows; their outputs are written when
@@ -539,6 +715,11 @@ pub fn up() -> bool {
     imp::up()
 }
 
+/// The fewest tokens a block needs for the tier's products (TORC_NPU_MIN_N, 32); 0 when the tier is down.
+pub fn min_tokens() -> usize {
+    imp::min_tokens()
+}
+
 /// (seconds waited for the NPU, graphs run), when the tier is up.
 pub fn stats() -> Option<(f64, u64)> {
     imp::stats()
@@ -562,6 +743,13 @@ fn counting() -> (bool, bool) {
         (crate::switches::given("TORC_NPU_PROFILE_OUT"), crate::switches::given("TORC_ROUTES"))
     });
     *ON
+}
+
+/// Whether routes are being counted or written (TORC_ROUTES, TORC_NPU_PROFILE_OUT, or one machine's usage file), so a
+/// caller need not build them otherwise.
+pub fn counting_on() -> bool {
+    let (cnt, rts) = counting();
+    cnt || rts || OWN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Counts one block's routes (each token's experts, from moe_tokens) when counting is on.

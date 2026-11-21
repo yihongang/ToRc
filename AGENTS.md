@@ -104,7 +104,21 @@ Change one thing at a time and measure each change (section 7). In this order:
    takes the most used ones from the next load on (the first session is slower than later ones; `TORC_NPU_HOT=0` turns
    that off). It is not bit-exact, so it only touches prompts, never replies. Run `npucheck` first. On one machine
    with a `qwen35moe` model held whole in memory, the NPU's defaults are blocks of 1024 and 32 hot experts a layer
-   (16 without 8 GB to spare); other models keep 256 and 16.
+   (16 without 8 GB to spare); other models keep 256 and 16. Inkling 2 can also put its hottest routed experts on the
+   NPU (`TORC_NPU_MIN_N=1`; attention, short convolutions and loop control stay on the CPU), and it does not earn
+   its place at the size this model runs: one visit's 8 experts at one token measured 2.20 ms on the NPU against
+   1.83 ms on the CPU taking them one at a time (which kept the MoE's whole share on one core). It only leads from
+   blocks of about 128 tokens (at 256: 39.5 ms against 50.8 ms over the pool, 25 ms of the NPU's being the CPU's SiTU
+   between its two graphs), which this model cannot produce without a batched prefill.
+   The CPU had the headroom, not the NPU: a token's eight experts are independent, and `Mat::apply` keeps a 1.6 MiB
+   expert matrix on the calling thread (its 4 MiB rule), so the MoE used one core. `moe_cpu` now gives each expert its
+   own thread, with the same `Mat::apply` calls and the sum still made in increasing expert id, so the logits are
+   byte-identical to the old path and to `TORC_INKLING_MOE_PAR=0` (which runs the old one, for an A/B on one binary).
+   On one Snapdragon X that took generation from 4.3 to 6.4 tok/s (233 to 156 ms a token), the experts falling from
+   about 87 ms a token to about 10: what is left is the attention, the short convolutions and the loop control, still
+   one token at a time. `npucheck model.torc experts` prints the NPU beside the CPU as it ran before (n=1 only) and a
+   pool sweep (read that column from n=2 up: `apply_group_multi` with one vector is a slow kernel, 4.09 ms against
+   0.83 for two rows); `npucheck model.torc list` says what it would upload.
 5. GPU (in the release zips, or built with the gpu feature): `TORC_GPU_ATTN=1` shares long prompts' attention between the GPU and the CPU,
    learning the split per machine. Not bit-exact, prompts only, a gain from a few thousand tokens of prompt. If the card
    runs out of memory, the tier switches off for the rest of the run and the CPU carries on.
